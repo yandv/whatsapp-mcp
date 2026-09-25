@@ -203,6 +203,9 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
+// set at startup so sendWhatsAppMessage can persist outgoing messages
+var sentMessageStore *MessageStore
+
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
@@ -277,6 +280,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mimeType = "video/quicktime"
 
 		// Document types (for any other file type)
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
@@ -347,6 +353,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
 				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -362,13 +369,25 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	// Persist what we sent: the API response only says "sent", and the outgoing message is not echoed back
+	// as an event for this device, so without this the store never has the id of our own messages.
+	if sentMessageStore != nil {
+		sender := ""
+		if client.Store.ID != nil {
+			sender = client.Store.ID.User
+		}
+		if storeErr := sentMessageStore.StoreMessage(resp.ID, recipientJID.String(), sender, message, resp.Timestamp, true, "", "", "", nil, nil, nil, 0); storeErr != nil {
+			fmt.Printf("Warning: could not store sent message %s: %v\n", resp.ID, storeErr)
+		}
+	}
+
+	return true, fmt.Sprintf("Message sent to %s (id %s)", recipient, resp.ID)
 }
 
 // Extract media info from a message
@@ -641,7 +660,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -669,7 +688,7 @@ func extractDirectPathFromURL(url string) string {
 	pathPart := parts[1]
 
 	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
+	// the CDN signature (ccb, oh, oe) lives in the query string; whatsmeow now downloads by direct path only, so keep it
 
 	// Create proper direct path format
 	return "/" + pathPart
@@ -800,14 +819,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -828,6 +847,7 @@ func main() {
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
+	sentMessageStore = messageStore
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
@@ -973,7 +993,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1008,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
