@@ -200,13 +200,14 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	ReplyTo   string `json:"reply_to,omitempty"`
 }
 
 // Function to send a WhatsApp message
 // set at startup so sendWhatsAppMessage can persist outgoing messages
 var sentMessageStore *MessageStore
 
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyTo string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -368,6 +369,27 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		msg.Conversation = proto.String(message)
 	}
 
+	if replyTo != "" {
+		quote, err := quotedContext(client, recipientJID, replyTo)
+		if err != nil {
+			return false, fmt.Sprintf("Error building reply to %s: %v", replyTo, err)
+		}
+		switch {
+		case msg.ImageMessage != nil:
+			msg.ImageMessage.ContextInfo = quote
+		case msg.AudioMessage != nil:
+			msg.AudioMessage.ContextInfo = quote
+		case msg.VideoMessage != nil:
+			msg.VideoMessage.ContextInfo = quote
+		case msg.DocumentMessage != nil:
+			msg.DocumentMessage.ContextInfo = quote
+		default:
+			// A plain Conversation cannot carry a ContextInfo, so a quoted text goes out as an extended text
+			msg.Conversation = nil
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{Text: proto.String(message), ContextInfo: quote}
+		}
+	}
+
 	// Send message
 	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
@@ -388,6 +410,55 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	return true, fmt.Sprintf("Message sent to %s (id %s)", recipient, resp.ID)
+}
+
+// quotedContext rebuilds the stored message replyTo of chat as the ContextInfo WhatsApp needs to show a reply:
+// the quoted id, who sent it, and enough of its content for the quote bubble.
+func quotedContext(client *whatsmeow.Client, chat types.JID, replyTo string) (*waProto.ContextInfo, error) {
+	var sender, content, mediaType, url string
+	var isFromMe bool
+	var mediaKey, fileSHA256, fileEncSHA256 []byte
+	var fileLength uint64
+	err := sentMessageStore.db.QueryRow(
+		"SELECT sender, content, is_from_me, media_type, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
+		replyTo, chat.String(),
+	).Scan(&sender, &content, &isFromMe, &mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
+	if err != nil {
+		return nil, err
+	}
+
+	// Only the user part of the sender is stored; in a direct chat it shares the chat's server (lid or phone),
+	// and our own messages are quoted under the identity that chat addresses us by.
+	participant := types.NewJID(sender, chat.Server)
+	if chat.Server == types.GroupServer {
+		participant = types.NewJID(sender, types.DefaultUserServer)
+	}
+	if isFromMe {
+		participant = client.Store.GetJID().ToNonAD()
+		if chat.Server == types.HiddenUserServer {
+			participant = client.Store.GetLID().ToNonAD()
+		}
+	}
+
+	quoted := &waProto.Message{}
+	switch mediaType {
+	case "image":
+		quoted.ImageMessage = &waProto.ImageMessage{Caption: proto.String(content), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
+	case "audio":
+		quoted.AudioMessage = &waProto.AudioMessage{PTT: proto.Bool(true), Mimetype: proto.String("audio/ogg; codecs=opus"), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
+	case "video":
+		quoted.VideoMessage = &waProto.VideoMessage{Caption: proto.String(content), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
+	case "document":
+		quoted.DocumentMessage = &waProto.DocumentMessage{Caption: proto.String(content), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
+	default:
+		quoted.Conversation = proto.String(content)
+	}
+
+	return &waProto.ContextInfo{
+		StanzaID:      proto.String(replyTo),
+		Participant:   proto.String(participant.String()),
+		QuotedMessage: quoted,
+	}, nil
 }
 
 // Extract media info from a message
@@ -725,7 +796,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyTo)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -740,6 +811,42 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	// Handler for the "typing..." indicator in a chat; WhatsApp only shows it while we are marked available
+	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Recipient string `json:"recipient"`
+			Typing    bool   `json:"typing"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(req.Recipient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
+			return
+		}
+		state := types.ChatPresencePaused
+		if req.Typing {
+			state = types.ChatPresenceComposing
+			err = client.SendPresence(r.Context(), types.PresenceAvailable)
+		}
+		if err == nil {
+			err = client.SendChatPresence(r.Context(), jid, state, types.ChatPresenceMediaText)
+		}
+		// Staying available would keep the phone from getting its own notifications
+		if err == nil && !req.Typing {
+			err = client.SendPresence(r.Context(), types.PresenceUnavailable)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: string(state)})
 	})
 
 	// Handler for downloading media
