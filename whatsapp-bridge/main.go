@@ -203,6 +203,12 @@ type SendMessageRequest struct {
 	ReplyTo   string `json:"reply_to,omitempty"`
 }
 
+// DeleteMessageRequest represents the request body for the delete message API
+type DeleteMessageRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+}
+
 // Function to send a WhatsApp message
 // set at startup so sendWhatsAppMessage can persist outgoing messages
 var sentMessageStore *MessageStore
@@ -410,6 +416,26 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	return true, fmt.Sprintf("Message sent to %s (id %s)", recipient, resp.ID)
+}
+
+// Function to delete a WhatsApp message for everyone in the chat
+func deleteWhatsAppMessage(client *whatsmeow.Client, chatJID string, messageID string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+
+	revoke := client.BuildRevoke(chat, types.EmptyJID, messageID)
+	_, err = client.SendMessage(context.Background(), chat, revoke)
+	if err != nil {
+		return false, fmt.Sprintf("Error deleting message: %v", err)
+	}
+
+	return true, fmt.Sprintf("Message %s deleted for everyone in %s", messageID, chatJID)
 }
 
 // quotedContext rebuilds the stored message replyTo of chat as the ContextInfo WhatsApp needs to show a reply:
@@ -798,6 +824,52 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyTo)
 		fmt.Println("Message sent", success, message)
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		// Send response
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	})
+
+	// Handler for deleting a message for everyone
+	http.HandleFunc("/api/delete", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req DeleteMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.ChatJID == "" {
+			http.Error(w, "Chat JID is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.MessageID == "" {
+			http.Error(w, "Message ID is required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Println("Received request to delete message", req.ChatJID, req.MessageID)
+
+		// Delete the message
+		success, message := deleteWhatsAppMessage(client, req.ChatJID, req.MessageID)
+		fmt.Println("Message deleted", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 

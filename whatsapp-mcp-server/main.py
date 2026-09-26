@@ -10,6 +10,7 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    delete_message as whatsapp_delete_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
@@ -180,6 +181,36 @@ def send_message(
     
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message, reply_to)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def delete_message(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Delete a WhatsApp message for everyone in the chat. Only messages sent by the connected account can be deleted this way.
+
+    Args:
+        message_id: The ID of the message to delete
+        chat_jid: The JID of the chat the message is in
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    # Validate input
+    if not message_id:
+        return {
+            "success": False,
+            "message": "Message ID must be provided"
+        }
+
+    if not chat_jid:
+        return {
+            "success": False,
+            "message": "Chat JID must be provided"
+        }
+
+    success, status_message = whatsapp_delete_message(message_id, chat_jid)
     return {
         "success": success,
         "message": status_message

@@ -651,6 +651,37 @@ def send_message(recipient: str, message: str, reply_to: Optional[str] = None) -
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def delete_message(message_id: str, chat_jid: str) -> Tuple[bool, str]:
+    try:
+        # Validate input
+        if not message_id:
+            return False, "Message ID must be provided"
+
+        if not chat_jid:
+            return False, "Chat JID must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/delete"
+        payload = {
+            "message_id": message_id,
+            "chat_jid": chat_jid,
+        }
+
+        response = requests.post(url, json=payload)
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input
