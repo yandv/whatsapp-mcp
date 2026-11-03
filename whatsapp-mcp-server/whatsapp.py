@@ -651,7 +651,7 @@ def send_message(recipient: str, message: str, reply_to: Optional[str] = None) -
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def delete_message(message_id: str, chat_jid: str) -> Tuple[bool, str]:
+def delete_message(message_id: str, chat_jid: str, for_me: bool = False) -> Tuple[bool, str]:
     try:
         # Validate input
         if not message_id:
@@ -664,6 +664,7 @@ def delete_message(message_id: str, chat_jid: str) -> Tuple[bool, str]:
         payload = {
             "message_id": message_id,
             "chat_jid": chat_jid,
+            "for_me": for_me,
         }
 
         response = requests.post(url, json=payload)
@@ -797,3 +798,24 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def create_group(name: str, participants: List[str]) -> Tuple[bool, str]:
+    response = requests.post(f"{WHATSAPP_API_BASE_URL}/group/create", json={"name": name, "participants": participants})
+    if response.status_code != 200 and not response.headers.get("Content-Type", "").startswith("application/json"):
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    result = response.json()
+    return result.get("success", False), result.get("message", "Unknown response")
+
+def update_group_participants(group_jid: str, participants: List[str], action: str) -> Tuple[bool, str]:
+    response = requests.post(f"{WHATSAPP_API_BASE_URL}/group/participants", json={"group": group_jid, "participants": participants, "action": action})
+    if response.status_code != 200 and not response.headers.get("Content-Type", "").startswith("application/json"):
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    result = response.json()
+    return result.get("success", False), result.get("message", "Unknown response")
+
+def edit_message(chat_jid: str, message_id: str, message: str) -> Tuple[bool, str]:
+    response = requests.post(f"{WHATSAPP_API_BASE_URL}/edit", json={"chat_jid": chat_jid, "message_id": message_id, "message": message})
+    if response.status_code != 200 and not response.headers.get("Content-Type", "").startswith("application/json"):
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    result = response.json()
+    return result.get("success", False), result.get("message", "Unknown response")

@@ -1,6 +1,9 @@
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
+    edit_message as whatsapp_edit_message,
+    create_group as whatsapp_create_group,
+    update_group_participants as whatsapp_update_group_participants,
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
@@ -187,12 +190,13 @@ def send_message(
     }
 
 @mcp.tool()
-def delete_message(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Delete a WhatsApp message for everyone in the chat. Only messages sent by the connected account can be deleted this way.
+def delete_message(message_id: str, chat_jid: str, for_me: bool = False) -> Dict[str, Any]:
+    """Delete a WhatsApp message sent by the connected account, for everyone (default) or only for me.
 
     Args:
         message_id: The ID of the message to delete
         chat_jid: The JID of the chat the message is in
+        for_me: True deletes only on this account's devices; others keep seeing it
 
     Returns:
         A dictionary containing success status and a status message
@@ -210,7 +214,7 @@ def delete_message(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Chat JID must be provided"
         }
 
-    success, status_message = whatsapp_delete_message(message_id, chat_jid)
+    success, status_message = whatsapp_delete_message(message_id, chat_jid, for_me)
     return {
         "success": success,
         "message": status_message
@@ -253,6 +257,44 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
         "success": success,
         "message": status_message
     }
+
+@mcp.tool()
+def edit_message(chat_jid: str, message_id: str, message: str) -> Dict[str, Any]:
+    """Edit the text of a message sent by the connected account (WhatsApp allows it up to 15 minutes after sending).
+
+    Args:
+        chat_jid: The JID of the chat the message is in
+        message_id: The ID of the message to edit
+        message: The new text
+    """
+    success, status_message = whatsapp_edit_message(chat_jid, message_id, message)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def create_group(name: str, participants: List[str]) -> Dict[str, Any]:
+    """Create a WhatsApp group. The name is limited to 25 characters.
+
+    Args:
+        name: Group name
+        participants: JIDs to add (e.g. "5511999999999@s.whatsapp.net"); you are added automatically
+
+    Returns:
+        success and, in message, the new group JID
+    """
+    success, message = whatsapp_create_group(name, participants)
+    return {"success": success, "message": message}
+
+@mcp.tool()
+def update_group_participants(group_jid: str, participants: List[str], action: str) -> Dict[str, Any]:
+    """Add, remove, promote or demote participants of a WhatsApp group.
+
+    Args:
+        group_jid: Group JID (ends with @g.us)
+        participants: JIDs to change
+        action: "add", "remove", "promote" or "demote"
+    """
+    success, message = whatsapp_update_group_participants(group_jid, participants, action)
+    return {"success": success, "message": message}
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:

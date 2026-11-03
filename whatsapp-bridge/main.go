@@ -24,6 +24,8 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -207,6 +209,8 @@ type SendMessageRequest struct {
 type DeleteMessageRequest struct {
 	ChatJID   string `json:"chat_jid"`
 	MessageID string `json:"message_id"`
+	// Only on this account's devices; the other participants keep seeing it
+	ForMe bool `json:"for_me"`
 }
 
 // Function to send a WhatsApp message
@@ -290,6 +294,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		case "pdf":
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/pdf"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
@@ -419,7 +432,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 }
 
 // Function to delete a WhatsApp message for everyone in the chat
-func deleteWhatsAppMessage(client *whatsmeow.Client, chatJID string, messageID string) (bool, string) {
+func deleteWhatsAppMessage(client *whatsmeow.Client, chatJID string, messageID string, forMe bool) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -427,6 +440,25 @@ func deleteWhatsAppMessage(client *whatsmeow.Client, chatJID string, messageID s
 	chat, err := types.ParseJID(chatJID)
 	if err != nil {
 		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+
+	if forMe {
+		deleteMedia := true
+		// whatsmeow has no builder for this patch; the index mirrors BuildStar for a message sent by this account
+		err = client.SendAppState(context.Background(), appstate.PatchInfo{
+			Type: appstate.WAPatchRegularHigh,
+			Mutations: []appstate.MutationInfo{{
+				Index:   []string{appstate.IndexDeleteMessageForMe, chat.String(), messageID, "1", "0"},
+				Version: 3,
+				Value: &waSyncAction.SyncActionValue{
+					DeleteMessageForMeAction: &waSyncAction.DeleteMessageForMeAction{DeleteMedia: &deleteMedia},
+				},
+			}},
+		})
+		if err != nil {
+			return false, fmt.Sprintf("Error deleting message for me: %v", err)
+		}
+		return true, fmt.Sprintf("Message %s deleted for me in %s", messageID, chatJID)
 	}
 
 	revoke := client.BuildRevoke(chat, types.EmptyJID, messageID)
@@ -868,7 +900,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to delete message", req.ChatJID, req.MessageID)
 
 		// Delete the message
-		success, message := deleteWhatsAppMessage(client, req.ChatJID, req.MessageID)
+		success, message := deleteWhatsAppMessage(client, req.ChatJID, req.MessageID, req.ForMe)
 		fmt.Println("Message deleted", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -919,6 +951,93 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: string(state)})
+	})
+
+	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+			Message   string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, err = client.SendMessage(r.Context(), chat, client.BuildEdit(chat, req.MessageID, &waProto.Message{Conversation: proto.String(req.Message)}))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: req.MessageID})
+	})
+
+	http.HandleFunc("/api/group/create", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Name         string   `json:"name"`
+			Participants []string `json:"participants"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		participants := make([]types.JID, 0, len(req.Participants))
+		for _, participant := range req.Participants {
+			jid, err := types.ParseJID(participant)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
+				return
+			}
+			participants = append(participants, jid)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		group, err := client.CreateGroup(r.Context(), whatsmeow.ReqCreateGroup{Name: req.Name, Participants: participants})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: group.JID.String()})
+	})
+
+	http.HandleFunc("/api/group/participants", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Group        string   `json:"group"`
+			Participants []string `json:"participants"`
+			Action       string   `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		group, err := types.ParseJID(req.Group)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
+			return
+		}
+		participants := make([]types.JID, 0, len(req.Participants))
+		for _, participant := range req.Participants {
+			jid, err := types.ParseJID(participant)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
+				return
+			}
+			participants = append(participants, jid)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, err = client.UpdateGroupParticipants(r.Context(), group, participants, whatsmeow.ParticipantChange(req.Action))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: req.Action})
 	})
 
 	// Handler for downloading media
