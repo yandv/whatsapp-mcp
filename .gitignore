@@ -5,3 +5,8 @@ whatsapp.log
 whatsapp-bridge/store/
 whatsapp-bridge/whatsapp-bridge
 whatsapp-bridge/whatsapp-bridge.*
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
