@@ -1,5 +1,18 @@
 # WhatsApp MCP Server
 
+## What this fork adds
+
+This is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp). On top of the original server it adds:
+
+- **Replies.** `send_message` takes an optional `reply_to` with the ID of a stored message in the same chat, and the text goes out quoting it.
+- **Edit and delete.** New `edit_message` and `delete_message` tools. Deleting revokes the message for everyone, or only for you with `for_me`.
+- **Groups.** New `create_group` and `update_group_participants` tools (add, remove, promote or demote).
+- **Typing presence.** The bridge accepts `POST /api/typing` with `{"recipient": "<jid>", "typing": true}` to show "typing..." in a chat, and sets the account back to offline when typing stops, so the phone keeps getting notifications.
+- **Sent messages in history.** Messages sent through the bridge are stored in the local SQLite database, so `list_messages` returns both sides of a conversation.
+- **Up-to-date whatsmeow**, keeping the signature used to download media.
+
+The rest of this README is the original documentation.
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
