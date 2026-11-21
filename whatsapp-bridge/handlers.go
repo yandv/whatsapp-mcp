@@ -21,6 +21,14 @@ type whatsappAPI interface {
 	UpdateGroupParticipants(ctx context.Context, jid types.JID, participantChanges []types.JID, action whatsmeow.ParticipantChange) ([]types.GroupParticipant, error)
 }
 
+// historyAPI is the slice of *whatsmeow.Client the history handler uses, so tests can fake it.
+type historyAPI interface {
+	BuildHistorySyncRequest(lastKnownMessageInfo *types.MessageInfo, count int) *waProto.Message
+	SendPeerMessage(ctx context.Context, message *waProto.Message) (whatsmeow.SendResponse, error)
+}
+
+type oldestMessageFunc func(chatJID string) (types.MessageInfo, error)
+
 type sendFunc func(recipient, message, mediaPath, replyTo string) (bool, string)
 type deleteFunc func(chatJID, messageID string, forMe bool) (bool, string)
 
@@ -176,4 +184,39 @@ func registerRoutes(mux *http.ServeMux, api whatsappAPI, send sendFunc, del dele
 	})
 }
 
+// Asks the phone for the messages older than the oldest one stored for this chat; they arrive as an ON_DEMAND HistorySync.
+func registerHistoryRoute(mux *http.ServeMux, api historyAPI, oldestMessage oldestMessageFunc) {
+	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+			Count   int    `json:"count"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		if req.Count == 0 {
+			req.Count = 50
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		oldest, err := oldestMessage(req.ChatJID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		oldest.Chat = chat
+		if _, err := api.SendPeerMessage(r.Context(), api.BuildHistorySyncRequest(&oldest, req.Count)); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "oldest_known": oldest.Timestamp})
+	})
+}
+
 var _ whatsappAPI = (*whatsmeow.Client)(nil)
+var _ historyAPI = (*whatsmeow.Client)(nil)
