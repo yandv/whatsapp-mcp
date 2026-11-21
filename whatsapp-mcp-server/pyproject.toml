@@ -9,3 +9,13 @@ dependencies = [
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "responses>=0.26.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
