@@ -1,5 +1,7 @@
 # WhatsApp MCP Server
 
+[![CI](https://github.com/yandv/whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/yandv/whatsapp-mcp/actions/workflows/ci.yml)
+
 ## What this fork adds
 
 This is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp). On top of the original server it adds:
@@ -12,6 +14,23 @@ This is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-m
 - **Up-to-date whatsmeow**, keeping the signature used to download media.
 
 The rest of this README is the original documentation.
+
+## Development
+
+The tests never touch a real WhatsApp session: the Go tests use `httptest` and a fake client, and the Python tests use a temporary SQLite database (built from the schema in `whatsapp-bridge/main.go`) and a mocked bridge HTTP API.
+
+```bash
+# Go bridge
+cd whatsapp-bridge
+go vet ./... && go test ./...
+
+# Python MCP server
+cd whatsapp-mcp-server
+uv sync
+uv run pytest
+```
+
+CI runs both on every push to `main` and on pull requests.
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
