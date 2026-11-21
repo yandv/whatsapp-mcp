@@ -168,7 +168,8 @@ def send_message(
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us").
+                 Use "status@broadcast" to post a text status on your own WhatsApp status
         message: The message text to send
         reply_to: Optional ID of a message in the same chat to quote, so the text goes out as a reply to it
     
@@ -226,7 +227,8 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us").
+                 Use "status@broadcast" to post the image or video on your own WhatsApp status
         media_path: The absolute path to the media file to send (image, video, document)
     
     Returns:
