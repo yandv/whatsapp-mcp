@@ -222,25 +222,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		return false, "Not connected to WhatsApp"
 	}
 
-	// Create JID for recipient
-	var recipientJID types.JID
-	var err error
-
-	// Check if recipient is a JID
-	isJID := strings.Contains(recipient, "@")
-
-	if isJID {
-		// Parse the JID string
-		recipientJID, err = types.ParseJID(recipient)
-		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
-		}
-	} else {
-		// Create JID from phone number
-		recipientJID = types.JID{
-			User:   recipient,
-			Server: "s.whatsapp.net", // For personal chats
-		}
+	recipientJID, err := parseRecipient(recipient)
+	if err != nil {
+		return false, jidError(err)
 	}
 
 	msg := &waProto.Message{}
@@ -485,32 +469,8 @@ func quotedContext(client *whatsmeow.Client, chat types.JID, replyTo string) (*w
 		return nil, err
 	}
 
-	// Only the user part of the sender is stored; in a direct chat it shares the chat's server (lid or phone),
-	// and our own messages are quoted under the identity that chat addresses us by.
-	participant := types.NewJID(sender, chat.Server)
-	if chat.Server == types.GroupServer {
-		participant = types.NewJID(sender, types.DefaultUserServer)
-	}
-	if isFromMe {
-		participant = client.Store.GetJID().ToNonAD()
-		if chat.Server == types.HiddenUserServer {
-			participant = client.Store.GetLID().ToNonAD()
-		}
-	}
-
-	quoted := &waProto.Message{}
-	switch mediaType {
-	case "image":
-		quoted.ImageMessage = &waProto.ImageMessage{Caption: proto.String(content), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
-	case "audio":
-		quoted.AudioMessage = &waProto.AudioMessage{PTT: proto.Bool(true), Mimetype: proto.String("audio/ogg; codecs=opus"), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
-	case "video":
-		quoted.VideoMessage = &waProto.VideoMessage{Caption: proto.String(content), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
-	case "document":
-		quoted.DocumentMessage = &waProto.DocumentMessage{Caption: proto.String(content), URL: proto.String(url), MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: proto.Uint64(fileLength)}
-	default:
-		quoted.Conversation = proto.String(content)
-	}
+	participant := quotedParticipant(sender, chat, isFromMe, client.Store.GetJID(), client.Store.GetLID())
+	quoted := buildQuotedMessage(storedMedia{Content: content, MediaType: mediaType, URL: url, MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: fileLength})
 
 	return &waProto.ContextInfo{
 		StanzaID:      proto.String(replyTo),
@@ -825,220 +785,13 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyTo)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+	registerRoutes(http.DefaultServeMux, client,
+		func(recipient, message, mediaPath, replyTo string) (bool, string) {
+			return sendWhatsAppMessage(client, recipient, message, mediaPath, replyTo)
+		},
+		func(chatJID, messageID string, forMe bool) (bool, string) {
+			return deleteWhatsAppMessage(client, chatJID, messageID, forMe)
 		})
-	})
-
-	// Handler for deleting a message for everyone
-	http.HandleFunc("/api/delete", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req DeleteMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.ChatJID == "" {
-			http.Error(w, "Chat JID is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.MessageID == "" {
-			http.Error(w, "Message ID is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to delete message", req.ChatJID, req.MessageID)
-
-		// Delete the message
-		success, message := deleteWhatsAppMessage(client, req.ChatJID, req.MessageID, req.ForMe)
-		fmt.Println("Message deleted", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
-	})
-
-	// Handler for the "typing..." indicator in a chat; WhatsApp only shows it while we are marked available
-	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Recipient string `json:"recipient"`
-			Typing    bool   `json:"typing"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-		jid, err := types.ParseJID(req.Recipient)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
-			return
-		}
-		state := types.ChatPresencePaused
-		if req.Typing {
-			state = types.ChatPresenceComposing
-			err = client.SendPresence(r.Context(), types.PresenceAvailable)
-		}
-		if err == nil {
-			err = client.SendChatPresence(r.Context(), jid, state, types.ChatPresenceMediaText)
-		}
-		// Staying available would keep the phone from getting its own notifications
-		if err == nil && !req.Typing {
-			err = client.SendPresence(r.Context(), types.PresenceUnavailable)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
-			return
-		}
-		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: string(state)})
-	})
-
-	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			ChatJID   string `json:"chat_jid"`
-			MessageID string `json:"message_id"`
-			Message   string `json:"message"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-		chat, err := types.ParseJID(req.ChatJID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, err = client.SendMessage(r.Context(), chat, client.BuildEdit(chat, req.MessageID, &waProto.Message{Conversation: proto.String(req.Message)}))
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
-			return
-		}
-		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: req.MessageID})
-	})
-
-	http.HandleFunc("/api/group/create", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Name         string   `json:"name"`
-			Participants []string `json:"participants"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-		participants := make([]types.JID, 0, len(req.Participants))
-		for _, participant := range req.Participants {
-			jid, err := types.ParseJID(participant)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
-				return
-			}
-			participants = append(participants, jid)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		group, err := client.CreateGroup(r.Context(), whatsmeow.ReqCreateGroup{Name: req.Name, Participants: participants})
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
-			return
-		}
-		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: group.JID.String()})
-	})
-
-	http.HandleFunc("/api/group/participants", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Group        string   `json:"group"`
-			Participants []string `json:"participants"`
-			Action       string   `json:"action"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-		group, err := types.ParseJID(req.Group)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
-			return
-		}
-		participants := make([]types.JID, 0, len(req.Participants))
-		for _, participant := range req.Participants {
-			jid, err := types.ParseJID(participant)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("Error parsing JID: %v", err), http.StatusBadRequest)
-				return
-			}
-			participants = append(participants, jid)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, err = client.UpdateGroupParticipants(r.Context(), group, participants, whatsmeow.ParticipantChange(req.Action))
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: err.Error()})
-			return
-		}
-		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: req.Action})
-	})
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
