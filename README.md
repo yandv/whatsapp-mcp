@@ -154,6 +154,14 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 
+### Posting to your status
+
+Send to the JID `status@broadcast` to post on your own WhatsApp status. whatsmeow delivers it to the contacts allowed by your status privacy setting, so no extra code is needed.
+
+- **send_message** with `recipient="status@broadcast"` posts a text status.
+- **send_file** with `recipient="status@broadcast"` posts an image or video. The MCP tool has no caption field; to post media with a caption, call the bridge directly: `POST /api/send` with `{"recipient": "status@broadcast", "message": "<caption>", "media_path": "<absolute path>"}`.
+- **delete_message** (or `POST /api/delete`) with `chat_jid="status@broadcast"` and the `id` returned by the send removes the status for everyone.
+
 ### Media Handling Features
 
 The MCP server supports both sending and receiving various media types:
