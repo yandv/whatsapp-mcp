@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -14,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,10 +29,13 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/util/cbcutil"
+	"go.mau.fi/whatsmeow/util/hkdfutil"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
@@ -661,6 +668,101 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+var mediaRetryWaiters sync.Map
+
+func requestMediaReupload(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, mediaKey []byte) (string, error) {
+	var sender string
+	var isFromMe bool
+	var timestamp time.Time
+	if err := messageStore.db.QueryRow(
+		"SELECT sender, is_from_me, timestamp FROM messages WHERE id = ? AND chat_jid = ?", messageID, chatJID,
+	).Scan(&sender, &isFromMe, &timestamp); err != nil {
+		return "", err
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return "", err
+	}
+	senderJID := chat
+	if chat.Server == types.GroupServer {
+		senderJID = types.NewJID(sender, types.HiddenUserServer)
+	}
+	if isFromMe {
+		senderJID = client.Store.ID.ToNonAD()
+	}
+
+	waiter := make(chan *events.MediaRetry, 1)
+	mediaRetryWaiters.Store(messageID, waiter)
+	defer mediaRetryWaiters.Delete(messageID)
+
+	info := &types.MessageInfo{
+		ID:            messageID,
+		Timestamp:     timestamp,
+		MessageSource: types.MessageSource{Chat: chat, Sender: senderJID, IsFromMe: isFromMe, IsGroup: chat.Server == types.GroupServer},
+	}
+	if err := client.SendMediaRetryReceipt(context.Background(), info, mediaKey); err != nil {
+		return "", err
+	}
+
+	select {
+	case evt := <-waiter:
+		if evt.Error != nil {
+			return "", fmt.Errorf("phone returned media retry error code %d", evt.Error.Code)
+		}
+		retry, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
+		if err != nil {
+			return "", err
+		}
+		if retry.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS {
+			return "", fmt.Errorf("phone could not reupload media: %s", retry.GetResult())
+		}
+		return retry.GetDirectPath(), nil
+	case <-time.After(60 * time.Second):
+		return "", fmt.Errorf("timed out waiting for the phone to reupload media")
+	}
+}
+
+// The phone re-encrypts on reupload, so the stored file_enc_sha256 no longer matches and client.Download rejects it.
+// Integrity is still checked through the HMAC and the plaintext file_sha256.
+func downloadReuploadedMedia(directPath string, mediaKey, fileSHA256 []byte, mediaType whatsmeow.MediaType) ([]byte, error) {
+	resp, err := http.Get("https://mmg.whatsapp.net" + directPath)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cdn returned %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return decryptReuploadedMedia(data, mediaKey, fileSHA256, mediaType, directPath, resp.Header.Get("Content-Type"))
+}
+
+func decryptReuploadedMedia(data, mediaKey, fileSHA256 []byte, mediaType whatsmeow.MediaType, directPath, contentType string) ([]byte, error) {
+	if len(data) <= 10 {
+		return nil, whatsmeow.ErrTooShortFile
+	}
+	keys := hkdfutil.SHA256(mediaKey, nil, []byte(mediaType), 112)
+	iv, cipherKey, macKey := keys[:16], keys[16:48], keys[48:80]
+	file, mac := data[:len(data)-10], data[len(data)-10:]
+	h := hmac.New(sha256.New, macKey)
+	h.Write(iv)
+	h.Write(file)
+	if !hmac.Equal(h.Sum(nil)[:10], mac) {
+		return nil, fmt.Errorf("%w (got %d bytes, %s, path %s)", whatsmeow.ErrInvalidMediaHMAC, len(data), contentType, directPath)
+	}
+	plain, err := cbcutil.Decrypt(cipherKey, iv, file)
+	if err != nil {
+		return nil, err
+	}
+	if sum := sha256.Sum256(plain); !bytes.Equal(sum[:], fileSHA256) {
+		return nil, whatsmeow.ErrInvalidMediaSHA256
+	}
+	return plain, nil
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -748,10 +850,17 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		// Old media leaves the WhatsApp CDN; only the phone can re-upload it, via a media retry receipt.
+		newPath, retryErr := requestMediaReupload(client, messageStore, messageID, chatJID, mediaKey)
+		if retryErr != nil {
+			return false, "", "", "", fmt.Errorf("failed to download media: %v; reupload: %v", err, retryErr)
+		}
+		mediaData, err = downloadReuploadedMedia(newPath, mediaKey, fileSHA256, waMediaType)
+		if err != nil {
+			return false, "", "", "", fmt.Errorf("failed to download reuploaded media: %v", err)
+		}
 	}
 
 	// Save the downloaded media to file
@@ -911,6 +1020,11 @@ func main() {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
+
+		case *events.MediaRetry:
+			if waiter, ok := mediaRetryWaiters.Load(v.MessageID); ok {
+				waiter.(chan *events.MediaRetry) <- v
+			}
 
 		case *events.HistorySync:
 			// Process history sync events
