@@ -763,6 +763,15 @@ func decryptReuploadedMedia(data, mediaKey, fileSHA256 []byte, mediaType whatsme
 	return plain, nil
 }
 
+// OldestMessage returns the oldest stored message of a chat, the anchor for asking the phone for older history.
+func (store *MessageStore) OldestMessage(chatJID string) (types.MessageInfo, error) {
+	var oldest types.MessageInfo
+	err := store.db.QueryRow(
+		"SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1", chatJID,
+	).Scan(&oldest.ID, &oldest.IsFromMe, &oldest.Timestamp)
+	return oldest, err
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -901,6 +910,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		func(chatJID, messageID string, forMe bool) (bool, string) {
 			return deleteWhatsAppMessage(client, chatJID, messageID, forMe)
 		})
+	registerHistoryRoute(http.DefaultServeMux, client, messageStore.OldestMessage)
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
