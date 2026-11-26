@@ -809,7 +809,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
+	// Stored names carry only a per-second timestamp, so several media sent in the same second
+	// would share a file; the message id keeps each one apart.
+	filename = messageID + "_" + filepath.Base(filename)
 	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
 	// Get absolute path
